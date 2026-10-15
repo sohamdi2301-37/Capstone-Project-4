@@ -14,7 +14,6 @@ env:
 jobs:
   deploy-staging:
     runs-on: ubuntu-latest
-    environment: staging
     steps:
       - uses: actions/checkout@v4
       - name: Configure AWS credentials using OIDC
