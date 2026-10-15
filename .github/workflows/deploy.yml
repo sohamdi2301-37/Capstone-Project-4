@@ -1,28 +1,43 @@
+
 name: Deploy to ECS
+
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
 permissions:
   id-token: write
   contents: read
+
 env:
   AWS_REGION: ap-south-1
   ECR_REPOSITORY: infra-as-code-pipeline
   ECS_CLUSTER: infra-as-code-pipeline
-  ECS_SERVICE: infra-as-code-pipeline
   CONTAINER_NAME: app
+
 jobs:
   deploy-staging:
+    name: Deploy to Staging
     runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Configure AWS credentials using OIDC
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Login to Amazon ECR
         id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Build and push immutable image
         id: build
         env:
@@ -32,43 +47,87 @@ jobs:
           docker build -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" ./app
           docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           echo "image=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-      - name: Download current task definition
+
+      - name: Download staging task definition
         run: |
-          aws ecs describe-task-definition --task-definition "$ECS_SERVICE" \
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_SERVICE" \
             --query taskDefinition > task-definition.json
-          python - <<'PY'
-          import json
-          p="task-definition.json"
-          d=json.load(open(p))
-          for k in ["taskDefinitionArn","revision","status","requiresAttributes","compatibilities","registeredAt","registeredBy"]:
-              d.pop(k, None)
-          json.dump(d, open(p,"w"))
-          PY
-      - uses: aws-actions/amazon-ecs-render-task-definition@v1
-        id: render
+        env:
+          ECS_SERVICE: infra-as-code-pipeline
+
+      - name: Render staging task definition
+        id: render-staging
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ steps.build.outputs.image }}
-      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+
+      - name: Deploy to staging
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition: ${{ steps.render.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
+          task-definition: ${{ steps.render-staging.outputs.task-definition }}
+          service: infra-as-code-pipeline
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
+
   deploy-production:
+    name: Deploy to Production
     needs: deploy-staging
     runs-on: ubuntu-latest
     environment: production
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Configure AWS credentials using OIDC
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Promote same image to production service
+
+      - name: Download production task definition
         run: |
-          echo "Configure a separate production ECS service and task definition before enabling this job."
-          echo "This guard intentionally prevents accidental deployment to an unconfigured production service."
-          exit 1
+          aws ecs describe-task-definition \
+            --task-definition infra-as-code-pipeline-production \
+            --query taskDefinition > production-task-definition.json
+
+          python - <<'PY'
+          import json
+
+          path = "production-task-definition.json"
+          with open(path) as f:
+              task = json.load(f)
+
+          for key in [
+              "taskDefinitionArn",
+              "revision",
+              "status",
+              "requiresAttributes",
+              "compatibilities",
+              "registeredAt",
+              "registeredBy"
+          ]:
+              task.pop(key, None)
+
+          with open(path, "w") as f:
+              json.dump(task, f)
+          PY
+
+      - name: Render production task definition
+        id: render-production
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: production-task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.deploy-staging.outputs.image }}
+
+      - name: Deploy to production
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-production.outputs.task-definition }}
+          service: infra-as-code-pipeline-production
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
